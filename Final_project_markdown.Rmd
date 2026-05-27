@@ -1,0 +1,1289 @@
+---
+title: "Final Project"
+author: "Sophia Mummert"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+library(dplyr)
+library(hms)
+library(tidyverse) 
+library(readxl) 
+library(ggplot2)
+library(lubridate)
+library(stringr)
+library(lme4)
+library(lmerTest)
+library(knitr)
+library(glmmTMB)
+library(ggeffects)
+library(DHARMa)
+library(vegan)
+library(ggsignif)
+library(ggforce)
+
+#import datasets#
+bintervention = read_excel("NVBP_Bintervention_Feeding.xlsx", 
+                                       sheet = "Focal_Feeding")
+binter_focal = read_excel("NVBP_Bintervention_Feeding.xlsx", 
+                          sheet = "Focal_Behavior_Scans")
+
+demography_table = read_excel("NV_DemographyTable.xlsx", 
+                              sheet = "nv_demography_table", 
+                              skip = 1, col_names = TRUE)
+food_list = read_excel("List of foods observed eaten by NVT baboons.xlsx")
+
+colors_15 = c(
+  "#F28E2B", # = fruit
+  "#59A14F", # = leaves 
+  "yellow", # = mushroom 
+  "#9C755F", # = roots
+  "#4E79A7", # = insects
+  "#EDC948", # = shoots
+  "#E15759", # = human foods
+  "#B07AA1", # = seeds
+  "#FF9DA7", # = flower
+  "#86BCB5", # = soil 
+  "darkolivegreen", # = bark
+  "grey" # = other
+  )
+
+```
+
+```{r Cleaning, echo=TRUE, message=FALSE, warning=FALSE, results=FALSE}
+#----------------------------------------------------#
+#                        Cleaning                    #
+#----------------------------------------------------#
+
+#demography table
+names(demography_table)[names(demography_table) == "alive_now?"] = "Status"
+names(demography_table)[names(demography_table) == "age_categeory_first_seen"] = "Age_Cat"
+names(demography_table)[names(demography_table) == "Code"] = "Focal_ID"
+
+demog = demography_table %>%
+  select(Name, Focal_ID, Sex, NV_Original, Status, Age_Cat) %>%
+  filter(Focal_ID %in% c("ES", "MS", "ZN", "RB", "LK", "GR", "KB", "BV", "SU"))
+
+demog[1,6] = "Parous"
+
+#####------- plant foods df --------#####
+food_list$Food_ID = tolower(food_list$Species)
+names(food_list)[names(food_list) == "Native, Alien, or Alien Invasive?"] = "Status"
+food_list$Status = tolower(food_list$Status)
+
+food_list = food_list %>%
+  distinct(Food_ID, .keep_all = TRUE)
+
+######--------- full bintervention -------#####
+bintervention$Food_ID = tolower(bintervention$Food_ID)
+bintervention$Food_part = tolower(bintervention$Food_part)
+
+bintervention = bintervention %>%
+  left_join(demog %>% select(Focal_ID, Sex, Age_Cat),
+            by = "Focal_ID") %>%
+  left_join(food_list %>% select(Food_ID, Status),
+            by = "Food_ID")
+
+
+#now just going to be alien versus indigenous, so changing the "alien invasive" to just "alien"
+bintervention = bintervention %>%
+  mutate(Status = if_else(str_detect(Status, "alien invasive"), "alien", Status))
+
+#making the rest of Status NAs unknown
+bintervention = bintervention %>%
+  mutate(Status = coalesce(Status, "unknown"))
+
+#more precise to say "unidentified"
+bintervention$Status[bintervention$Status == "unknown"] = "unidentified"
+
+################### time cleaning #############################
+
+#cleaning time function taken from previous project
+convert_mixed_time = function(x) {
+  if (is.factor(x)) x = as.character(x)
+  
+  if (grepl("^1899-12-31", x)) {
+    time_part = sub("1899-12-31\\s+", "", x)
+    try_excel_hms = suppressWarnings(as.numeric(lubridate::hms(time_part)))
+    if (!is.na(try_excel_hms)) return(try_excel_hms)
+  }
+  
+  try_hms = suppressWarnings(as.numeric(lubridate::hms(x)))
+  if (!is.na(try_hms)) return(try_hms)
+  
+  num = suppressWarnings(as.numeric(x))
+  if (!is.na(num)) return(num * 86400)
+  
+  return(NA_real_)
+}
+
+### binter_focal bc I need to get the TMF start times ###
+binter_focal$Focal_behavior = tolower(binter_focal$Focal_behavior)
+
+binter_focal = binter_focal %>%
+  select(Focal_Index, Date, ScanNumber, ScanTime, Focal_behavior) %>%
+  filter(ScanNumber == 1) %>%
+  filter(Focal_behavior == "feed")
+
+
+binter_focal = binter_focal %>%
+  mutate(
+    ScanTime = sapply(ScanTime, convert_mixed_time)) %>%
+  mutate(ScanEnd = ScanTime + 600)
+
+#remove duplicate groups in binter_focal that need to be cleaned
+time_binter = binter_focal %>%
+  group_by(Focal_Index) %>%
+  summarise(
+    ScanTime = first(ScanTime),
+    ScanEnd  = first(ScanEnd),
+    .groups = "drop"
+  )
+
+#clean time columns to convert to seconds, and use TMF as start times when 
+#start times are missing
+bintervention = bintervention %>% 
+  mutate(start_time_sec = sapply(Start_time, convert_mixed_time), 
+         end_time_sec = sapply(End_time, convert_mixed_time), 
+        TMF_start = sapply(TMF_start, convert_mixed_time), 
+        TMF_end = sapply(TMF_end, convert_mixed_time))
+
+bintervention = bintervention %>%
+  mutate(
+    start_time_sec = coalesce(start_time_sec, TMF_start),
+    end_time_sec   = coalesce(end_time_sec, TMF_end),
+    Duration_sec = end_time_sec - start_time_sec
+  )
+
+bintervention = bintervention %>%
+  select(Focal_Index, Day, Month, Year, Date, Focal_ID, 
+         Food_ID, Food_part, Context_and_comments, Status, Sex, 
+         Age_Cat, TMF_start, start_time_sec, end_time_sec, TMF_end, 
+         Duration_sec)
+
+#honestly this whole time_binter and time_bintervention fix took legitimately 
+#2 days to figure out and I just kept throwing things at the code until I got it
+#to work work and I'm almost positive there's a better way to do it but this is
+#what I got. 
+
+#basically, if the start and end times are there, keep
+#next, if the TMF start or end was there (I added to my local excel file), then
+#use those to fill in missing start or end time. 
+#next, if bout start or end is empty AND TMF start or end time is empty, pull
+#from the focal behavior scan with corresponding focal index (which I input for
+#those missing focal_index in feeding tab on local file). Therefore, binterfocal 
+#is filtered for: behavior = feed, scan = 1. SO that SHOULD account for all the 
+#missing TMF start, then automatically adds 600 seconds for TMF end. I just 
+#manually fill in the TMF ends for entries that had a start time but "in prog"
+#for end. This accounts for all entries marked "in prog". The only 10 leftover 
+#were from TMFs that have weird discrepancies in the field datasheets or are 
+#missing the field sheets entirely.
+
+time_bintervention = bintervention %>%
+  left_join(time_binter, by = "Focal_Index") %>%
+  mutate(
+    TMF_start = ifelse(
+      is.na(TMF_start) & is.na(start_time_sec),
+      ScanTime,
+      TMF_start
+    ),
+    TMF_end = ifelse(
+      is.na(TMF_end) & is.na(end_time_sec),
+      ScanEnd,
+      TMF_end
+    )
+  ) %>%
+  select(-ScanTime, -ScanEnd) %>%
+  mutate(
+    start_time_sec = coalesce(start_time_sec, TMF_start),
+    end_time_sec   = coalesce(end_time_sec, TMF_end),
+    Duration_sec = end_time_sec - start_time_sec
+  )
+
+#combine into one AF cat
+time_bintervention = time_bintervention %>%
+  mutate(
+    Sex_Age = case_when(
+      Sex == "female" & Age_Cat %in% c("Parous", "Nulliparous") ~ "Adult female",
+      Age_Cat == "Juvenile" ~ "Juvenile",
+      TRUE ~ paste(Age_Cat, Sex)
+    )
+  )
+
+#I removed the 10 entries that still have NA in the duration section
+#because I cannpt "clean" them in my dataset (missing, etc)
+clean_bintervention = time_bintervention %>%
+  select(Focal_Index, Date, Focal_ID, 
+         Food_ID, Food_part, Status,
+         Context_and_comments, 
+         Duration_sec, Sex, Age_Cat, Sex_Age) %>%
+  drop_na(Duration_sec)
+###################################################################
+
+# food part cleaning #
+unique(bintervention$Food_part)
+#starting with 91 unique entries
+
+clean_food_part = clean_bintervention %>%
+  select(Focal_Index, Focal_ID, Date, Food_ID, Food_part, 
+         Context_and_comments, Duration_sec, Sex_Age, Status) %>%
+  mutate(
+    Food_part_raw = str_to_lower(Food_part),
+    Food_part_raw = str_trim(Food_part_raw),
+    
+    #all of this part is cleaning but in R because it seemed easier to catch things 
+    Food_part_raw = str_replace_all(Food_part_raw, "\\(", ""),
+    Food_part_raw = str_replace_all(Food_part_raw, "\\)", ""),
+    
+    Food_part_raw = str_replace_all(Food_part_raw, "leaves - mature", "mature leaf"),
+    Food_part_raw = str_replace_all(Food_part_raw, "mature and young leaves", 
+                                    "mature leaf and young leaf"),
+    Food_part_raw = str_replace_all(Food_part_raw, "fruti", "fruit"),
+    Food_part_raw = str_replace_all(Food_part_raw, "fruits", "fruit"),
+    Food_part_raw = str_replace_all(Food_part_raw, "leafs", "leaf"),
+    Food_part_raw = str_replace_all(Food_part_raw, "leaves", "leaf"),
+    Food_part_raw = str_replace_all(Food_part_raw, "leave", "leaf"),
+    Food_part_raw = str_replace_all(Food_part_raw, "young sapling", "young leaf"),
+    Food_part_raw = str_replace_all(Food_part_raw, "leavee", "leaf"),
+    Food_part_raw = str_replace_all(Food_part_raw, "shoots?|short shoot|shoots", "shoot"),
+    Food_part_raw = str_replace_all(Food_part_raw, "roots?", "root"),
+    Food_part_raw = str_replace_all(Food_part_raw, "seeds?|brown seeds", "seed"),
+    Food_part_raw = str_replace_all(Food_part_raw, "seed pods", "seed"),
+    Food_part_raw = str_replace_all(Food_part_raw, "flowers?", "flower"),
+    Food_part_raw = str_replace_all(Food_part_raw, "outer ?bark|inner bark", "bark"),
+    Food_part_raw = str_replace_all(Food_part_raw, "matures leaf", "mature leaf"),
+    Food_part_raw = str_replace_all(Food_part_raw, "mature leafs", "mature leaf"),
+    Food_part_raw = str_replace_all(Food_part_raw, "immature leafs|immature leaf", "young leaf"),
+    Food_part_raw = str_replace_all(Food_part_raw, "leaf,young", "young leaf"),
+    Food_part_raw = str_replace_all(Food_part_raw, "matures leaf", "mature leaf"),
+    Food_part_raw = str_replace_all(Food_part_raw, "mature leafs", "mature leaf"),
+    Food_part_raw = str_replace_all(Food_part_raw, "immature leafs|immature leaf", "young leaf"),
+    Food_part_raw = str_replace_all(Food_part_raw, "leaf,young", "young leaf"),
+    Food_part_raw = str_replace_all(Food_part_raw, "leaf-young", "young leaf"),
+    Food_part_raw = str_replace_all(Food_part_raw, "leaf-mature", "mature leaf"),
+    Food_part_raw = str_replace_all(Food_part_raw, "mature leavee", "mature leaf"),
+    Food_part_raw = str_replace_all(Food_part_raw, "fruit unripe", "unripe fruit"),
+    #making stems = shoots for these grasses, there isn't clear standardized terminology 
+    #in the literature...
+    Food_part_raw = str_replace_all(Food_part_raw, "stem base|stem", "shoot"),
+    Food_part_raw = str_replace_all(Food_part_raw, "dirt|soil", "soil"),
+    Food_part_raw = str_replace_all(Food_part_raw, "body", "insect"),
+    Food_part_raw = str_replace_all(Food_part_raw, "peel", "trash"),
+    Food_part_raw = str_replace_all(Food_part_raw, "leaves/stick", "leaves,stick"),
+    Food_part_raw = str_replace_all(Food_part_raw, "na|unknown|unk", "other"),
+    
+    Food_part_raw = str_replace_all(Food_part_raw, "\\s*,\\s*", ","),
+    
+    Food_part_raw = str_replace_all(Food_part_raw, " and |/|&|-|\\.", ","),
+    Food_part_raw = str_replace_all(Food_part_raw, ",+", ","),
+    
+    Food_part_raw = str_trim(Food_part_raw)) %>%
+  
+  #some have more than 1 plant part, separate them to be counted as separate ?
+  mutate(
+    n_parts = ifelse(is.na(Food_part_raw), 1,
+                     str_count(Food_part_raw, ",") + 1)
+  ) %>%
+  
+  separate_rows(Food_part_raw, sep = ",") %>%
+  mutate(Food_part_raw = str_trim(Food_part_raw)) %>%
+  
+  #can't keep rewriting this cleaning code so adding breakthrough typos here
+  mutate(
+    Food_part_raw = str_replace_all(Food_part_raw, "shoots", "shoot"),
+    Food_part_raw = str_replace_all(Food_part_raw, "insects", "insect"),
+    Food_part_raw = str_replace_all(Food_part_raw, "mature leafe", "mature leaf"),
+    #putting moss, stick, and bulb? into other because of low n
+    Food_part_raw = str_replace_all(Food_part_raw, "stick|moss|bulb", "other"),
+    Food_part_raw = str_replace_all(Food_part_raw, "trash", "human_foods"),
+    Food_part_raw = str_trim(Food_part_raw)
+  ) %>%
+  
+  #also want to distinguish between mature and young leaves + ripe fruit
+  mutate(
+    state = case_when(
+      str_detect(Food_part_raw, "unripe") ~ "unripe",
+      str_detect(Food_part_raw, "ripe") ~ "ripe",
+      str_detect(Food_part_raw, "young|immature") ~ "young",
+      str_detect(Food_part_raw, "mature") ~ "mature",
+      TRUE ~ NA_character_
+    ), 
+    Food_part_clean = str_remove_all(
+      Food_part_raw,
+      "young|immature|mature|ripe|unripe"
+    ),
+    Food_part_clean = str_trim(Food_part_clean)) %>%
+  
+  mutate(
+    duration_part = Duration_sec
+  )
+
+unique(clean_food_part$Food_part_clean)
+#end with 12 unique food parts
+##############################
+
+#fixing some "other" for status
+clean_food_part = clean_food_part %>%
+  mutate(Status = if_else(str_detect(Food_part_clean, "human_foods"), "human food", Status)) %>%
+  mutate(Status = if_else(str_detect(Food_part_clean, "mushroom"), "other", Status)) %>%
+  mutate(Status = if_else(str_detect(Food_part_clean, "insect"), "other", Status))
+
+
+```
+
+# Exploratory
+```{r Food Type and Status Usage Proportion by Age/Sex, echo=FALSE, message=FALSE, warning=FALSE}
+
+#### Food Status by Sex/Age Class  #####
+food_status_summary = clean_food_part %>%
+  group_by(Sex_Age, Status) %>%  # Status = indigenous/exotic
+  summarise(total_time = sum(Duration_sec, na.rm = TRUE)) %>%
+  group_by(Sex_Age) %>%
+  mutate(prop = total_time / sum(total_time))
+
+# final pie: AF vs J proportions food status
+food_status_summary = food_status_summary %>%
+  group_by(Sex_Age) %>%
+  mutate(
+    end = 2 * pi * cumsum(prop),
+    start = lag(end, default = 0),
+    mid = (start + end) / 2,
+    label = scales::percent(prop, accuracy = 1)
+  ) 
+
+food_status_summary$Status = factor(
+  food_status_summary$Status,
+  levels = c("alien", "indigenous", "unidentified", "human food", "other")
+)
+
+pie_1 = 
+  ggplot(food_status_summary) +
+  geom_arc_bar(
+    aes(
+      x0 = 0, y0 = 0,
+      r0 = 0, r = 1,
+      start = start, end = end,
+      fill = Status
+    ),
+    color = "white"
+  ) +
+  facet_wrap(~ Sex_Age) +
+  geom_text(
+    aes(
+      x = 1.4 * sin(mid),
+      y = 1.4 * cos(mid),
+      label = label
+    ),
+    size = 3
+  ) +
+  geom_segment(
+    aes(
+      x = sin(mid),
+      y = cos(mid),
+      xend = 1.2 * sin(mid),
+      yend = 1.2 * cos(mid)
+    ),
+    color = "black"
+  ) +
+  scale_fill_manual(values = c(
+    "#F28E2B",
+    "darkolivegreen", 
+    "grey",
+    "#E15759",
+    "#4E79A7"
+  )) +
+  coord_fixed(clip = "off",
+              xlim = c(-1.5, 1.5),
+              ylim = c(-1, 1.5)) +
+  theme_void(base_size = 14) +
+  theme(
+    strip.text = element_text(size = 14),
+    legend.text = element_text(size = 12)
+  ) + 
+  labs(fill = "Food Status") +
+  theme(
+  plot.margin = margin(t = 10, r = 20, b = 0, l = 20)
+)
+
+print(pie_1)
+#save plot
+ggsave(
+  filename = "plot1.jpg",
+  plot = last_plot(),
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 300
+)
+
+
+### Food type usage by Age/Sex class ###
+
+food_part_summary = clean_food_part %>%
+  group_by(Sex_Age, Food_part_clean) %>%
+  summarise(total_time = sum(duration_part, na.rm = TRUE),
+            bouts = n()) %>%
+  group_by(Sex_Age) %>%
+  mutate(prop = total_time / sum(total_time)) %>%
+  ungroup() %>%
+#for lumping into other to make less busy
+  mutate(Food_part_clean = ifelse(prop < 0.01, "other", Food_part_clean)) %>%
+  group_by(Sex_Age, Food_part_clean) %>%
+  summarise(total_time = sum(total_time), bouts = sum(bouts), .groups = "drop") %>%
+  group_by(Sex_Age) %>%
+  mutate(prop = total_time / sum(total_time))
+
+#Other: now encompasses vine, bulbs, moss, sticks, unclean/indeterminate food cats
+#of "decaying leaf matter" or other unknowns
+#and in this summary, additionally those that account for less than 1% of total
+#diet duration
+
+food_part_summary$Food_part_clean = factor(
+  food_part_summary$Food_part_clean,
+  levels = c(
+    "fruit","leaf", "mushroom", "root", "shoot",
+    "human_foods","seed", "bark", "flower","soil", "other"))
+
+
+
+# final pie: AF vs J Food part proportion
+food_part_summary = food_part_summary %>%
+  group_by(Sex_Age) %>%
+  mutate(
+    end = 2 * pi * cumsum(prop),
+    start = lag(end, default = 0),
+    mid = (start + end) / 2,
+    label = scales::percent(prop, accuracy = 1)
+  )
+
+pie_2 = 
+  ggplot(food_part_summary) +
+  geom_arc_bar(
+    aes(
+      x0 = 0, y0 = 0,
+      r0 = 0, r = 1,
+      start = start, end = end,
+      fill = Food_part_clean
+    ),
+    color = "white"
+  ) +
+  facet_wrap(~ Sex_Age) +
+  geom_text(
+    aes(
+      x = 1.4 * sin(mid),
+      y = 1.4 * cos(mid),
+      label = label
+    ),
+    size = 3
+  ) +
+  geom_segment(
+    aes(
+      x = sin(mid),
+      y = cos(mid),
+      xend = 1.2 * sin(mid),
+      yend = 1.2 * cos(mid)
+    ),
+    color = "black"
+  ) +
+  labs(fill = "Food Type") +
+scale_fill_manual(values = c(
+  "#F28E2B", # = fruit
+  "#59A14F", # = leaves 
+  "yellow", # = mushroom 
+  "#9C755F", # = roots
+  "#EDC948", # = shoots
+  "#E15759", # = human foods
+  "#B07AA1", # = seeds
+  "grey" # = other
+  ))  +
+  coord_fixed(clip = "off",
+              xlim = c(-1.5, 1.5),
+              ylim = c(-1.5, 1.5)) +
+  theme_void(base_size = 14) +
+  theme(
+    strip.text = element_text(size = 14),
+    legend.text = element_text(size = 12)
+  ) + 
+  theme(
+  plot.margin = margin(t = 0, r = 20, b = 0, l = 20)
+)
+print(pie_2)
+
+#save plot
+ggsave(
+  filename = "pie2.jpg",
+  plot = last_plot(),
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 300
+)
+
+
+#bar option?
+ggplot(food_part_summary,
+       aes(x = Sex_Age, y = prop, fill = Food_part_clean)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("#F28E2B", # = fruit
+  "#59A14F", # = leaves 
+  "yellow", # = mushroom 
+  "#9C755F", # = roots
+  "#EDC948", # = shoots
+  "#E15759", # = human foods
+  "#B07AA1", # = seeds
+  "grey" # = other
+  )) +
+  labs(
+    x = "Class",
+    y = "Proportion of Feeding Time",
+    fill = "Food Part"
+  ) +
+  theme_minimal(base_size = 14) + 
+    theme(
+  plot.title = element_text(size = 18), 
+  legend.text = element_text(size = 12))
+
+
+
+#total time
+results_table = food_part_summary %>%
+  mutate(percent = round(prop * 100, 1)) %>%
+  select(Sex_Age, Food_part_clean, percent)
+print(results_table)
+
+  
+```
+
+```{r Individual Proportional Variation, echo=TRUE, message=FALSE, warning=FALSE}
+
+indiv_food_part_percentage = clean_food_part %>%
+  group_by(Focal_ID, Sex_Age, Food_part_clean) %>%
+  summarise(total_time = sum(duration_part, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Focal_ID) %>%
+  mutate(prop_time = total_time / sum(total_time)) %>%
+  ungroup() %>%
+  
+  mutate(Food_part_clean = ifelse(prop_time < 0.01, "other", Food_part_clean)) %>%
+  group_by(Focal_ID, Sex_Age, Food_part_clean) %>%
+  summarise(total_time = sum(total_time), .groups = "drop") %>%
+  group_by(Focal_ID) %>%
+  mutate(prop_time = total_time / sum(total_time),
+         percent = prop_time * 100) %>%
+  ungroup()
+
+indiv_food_part_percentage$Food_part_clean = factor(
+  indiv_food_part_percentage$Food_part_clean,
+  levels = c(
+    "fruit","leaf", "mushroom", "root", "insect", "shoot", 
+    "human_foods", "seed", "flower", "bark","soil", "other"))
+indiv_food_part_percentage$Focal_ID = factor(indiv_food_part_percentage$Focal_ID, 
+  levels = c("GR", "RB", "ES", "MS", "ZN",  "LK",  "KB", "BV", "SU"))
+
+
+#final stacked: individual variation of food type
+stackedbar_3 = 
+  ggplot(indiv_food_part_percentage, aes(x = Focal_ID, y = percent, fill = Food_part_clean)) +
+  geom_col(position = "fill") +
+  labs(x = "Individual", y = "Proportion of Time Feeding", fill = "Food Part") +
+  scale_fill_manual(values = c(
+  "#F28E2B", # = fruit
+  "#59A14F", # = leaves 
+  "yellow", # = mushroom 
+  "#9C755F", # = roots
+  "#EDC948", # = shoots
+  "#E15759", # = human foods
+  "#B07AA1", # = seeds
+  "#FF9DA7", # = flower
+  "#86BCB5", # = soil 
+  "darkolivegreen", # = bark
+  "grey" # = other
+  )) +
+  labs(fill = "Food Type", 
+       x = "Focal ID") +
+  theme_minimal()
+
+print(stackedbar_3)
+
+#save plot
+ggsave(
+  filename = "stacked3.jpg",
+  plot = last_plot(),
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 300
+)
+# final results table per individual
+
+food_order = c(
+    "fruit","leaf","shoot","seed","mushroom","root","insect","human_foods", 
+    "bark", "flower", "soil", "other")
+
+#reset without rounding
+indiv_food_part_table = indiv_food_part_percentage %>%
+  select(Focal_ID, Food_part_clean, Sex_Age, percent) %>%
+  pivot_wider(names_from = Food_part_clean, values_from = percent) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 1))) %>%
+  replace(is.na(.), 0) %>%
+  select(Focal_ID, Sex_Age, any_of(food_order)) %>%
+  rename_with(~ paste0(str_to_title(.x), " (%)"),
+              -c(Focal_ID, Sex_Age)) %>%
+  rename(Class = Sex_Age) %>%
+  arrange(Class)
+
+print(indiv_food_part_table)
+
+
+##### repeating for indig #####
+indiv_food_stat_percentage = clean_food_part %>%
+  group_by(Focal_ID, Sex_Age, Status) %>%
+  summarise(total_time = sum(duration_part, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Focal_ID) %>%
+  mutate(prop_time = total_time / sum(total_time)) %>%
+  ungroup() %>%
+  group_by(Focal_ID, Sex_Age, Status) %>%
+  summarise(total_time = sum(total_time), .groups = "drop") %>%
+  group_by(Focal_ID) %>%
+  mutate(prop_time = total_time / sum(total_time),
+         percent = prop_time * 100) %>%
+  ungroup()
+
+indiv_food_stat_percentage$Focal_ID = factor(indiv_food_stat_percentage$Focal_ID, 
+  levels = c("GR", "RB", "ES", "MS", "ZN",  "LK",  "KB", "BV", "SU"))
+
+indiv_food_stat_percentage$Status = factor(
+  indiv_food_stat_percentage$Status,
+  levels = c("alien", "indigenous", "unidentified", "human food", "other")
+)
+
+stackedbar_6 = 
+  ggplot(indiv_food_stat_percentage, aes(x = Focal_ID, y = percent, fill = Status)) +
+  geom_col(position = "fill") +
+  labs(x = "Individual", y = "Proportion of Time Feeding", fill = "Catagories") +
+  scale_fill_manual(values = c(
+    "#F28E2B",
+    "darkolivegreen",
+    "grey",
+    "#E15759",
+    "#4E79A7"
+  )) +
+  labs(fill = "Food Status", 
+       x = "Focal ID") +
+  theme_minimal()
+print(stackedbar_6)
+
+#save plot
+ggsave(
+  filename = "stacked6.jpg",
+  plot = last_plot(),
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 300
+)
+
+
+```
+
+```{r Food Part Variation using total raw duration, echo=TRUE, message=FALSE, warning=FALSE}
+#final boxplot: variation in feeding bout duration ordered by median
+
+food_order = clean_food_part %>%
+  group_by(Food_part_clean) %>%
+  summarise(med = median(duration_part, na.rm = TRUE)) %>%
+  arrange(med) %>%
+  pull(Food_part_clean)
+clean_food_part$Food_part_clean = factor(
+  clean_food_part$Food_part_clean,
+  levels = food_order
+)
+boxplot_4 =
+ggplot(clean_food_part,
+       aes(x = Food_part_clean, y = duration_part, fill = Sex_Age)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA,
+               position = position_dodge(0.8)) +
+  geom_jitter(
+    aes(color = Sex_Age),
+    position = position_jitterdodge(
+      jitter.width = 0.15,
+      dodge.width = 0.8
+    ),
+    alpha = 0.4,
+    size = 1
+  ) +
+  scale_fill_manual(values = c("darkorchid4", "gold"))+
+  scale_color_manual(values = c("darkorchid4", "gold4"))+
+  labs(
+    x = "Food Type",
+    y = "Duration (seconds)",
+    fill = "Age-Sex Class",
+    color = "Age-Sex Class"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(size = 14, angle = 45, hjust = 1),
+    plot.title = element_text(size = 16)
+  ) +
+  theme(
+  plot.margin = margin(t = 10, r = 20, b = 10, l = 20)
+)
+print(boxplot_4)
+
+#save plot
+ggsave(
+  filename = "boxplot4.jpg",
+  plot = last_plot(),
+  width = 13,
+  height = 7,
+  units = "in",
+  dpi = 300
+)
+
+
+```
+
+# Analyses
+
+```{r Analyses on proportional data (Food status), echo=TRUE, message=FALSE, warning=FALSE}
+
+#### Comparison of Indigenous vs Alien Duration proportions for AF and J
+indiv_status = clean_food_part %>%
+  group_by(Focal_ID, Sex_Age, Status) %>%
+  summarise(total_duration = sum(Duration_sec, na.rm = TRUE)) %>%
+  group_by(Focal_ID) %>%
+  mutate(prop_duration = total_duration / sum(total_duration)) %>%
+  ungroup()
+
+alien_prop_table = clean_food_part %>%
+  group_by(Focal_ID, Sex_Age) %>%
+  summarise(
+    total_time = sum(Duration_sec, na.rm = TRUE),
+    indigenous_time = sum(Duration_sec[Status == "indigenous"], na.rm = TRUE),
+    alien_time = sum(Duration_sec[Status == "alien"], na.rm = TRUE),
+    prop_indigenous = indigenous_time / total_time,
+    prop_alien = alien_time / total_time
+  ) %>%
+  ungroup()
+print(alien_prop_table)
+
+############ permanova for total comp ##################
+
+stat_diet_matrix = clean_food_part %>%
+  group_by(Focal_ID, Sex_Age, Status) %>%
+  summarise(total = sum(Duration_sec), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = Status, values_from = total, values_fill = 0)
+
+stat_dist_matrix = vegdist(stat_diet_matrix[,-c(1,2)], method = "bray")
+adonis2(stat_dist_matrix ~ Sex_Age, data = stat_diet_matrix)
+#F = 1.60, R2 = .19, p = 0.224
+#19% of diet comp variation is explained by class, but not signif
+
+
+#check for homogeneity of dispersion, as independence is satisfied by design
+stat_disp = betadisper(stat_dist_matrix, stat_diet_matrix$Sex_Age)
+anova(stat_disp)
+#F = 0.028, p = 0.872
+#no significant difference in dispersion between group, PERMANOVA valid
+#bray used for proportional data
+
+boxplot(stat_dist_matrix)
+#no outliers pulling distance matrix
+
+#plotting PERMANOVA into 2D
+stat_nmds = metaMDS(stat_diet_matrix[,-c(1,2)], distance = "bray", k = 2)
+stat_scores = as.data.frame(stat_nmds$points)
+stat_scores$Sex_Age = stat_diet_matrix$Sex_Age
+
+ggplot(stat_scores, aes(x = MDS1, y = MDS2, color = Sex_Age)) +
+  geom_point(size = 3) +
+  stat_ellipse(level = 0.95) +
+  theme_minimal()
+
+
+
+################# Wilcoxon ######################
+#alien
+wilcox.test(prop_alien ~ Sex_Age, data = alien_prop_table)
+#W = 12, p = 0.55, not significant, no dif
+
+#indig
+wilcox.test(prop_indigenous ~ Sex_Age, data = alien_prop_table)
+#W = 5, p = 0.38, not significant, no dif
+
+#checking distributions
+ggplot(alien_prop_table, aes(x = Sex_Age, y = prop_alien, fill = Sex_Age)) +
+  geom_violin(alpha = 0.4) +
+  geom_boxplot(width = 0.2) +
+  theme_minimal()
+#juveniles showing skew downwards, so shape may be different 
+ggplot(alien_prop_table, aes(x = Sex_Age, y = prop_indigenous, fill = Sex_Age)) +
+  geom_violin(alpha = 0.4) +
+  geom_boxplot(width = 0.2) +
+  theme_minimal()
+#juveniles showing concentrated around 50% indig, with AF having more spread
+#very low n of juveniles makes this a tricky comparison
+
+```
+
+
+```{r Analyses on proportional data (Food Part), echo=TRUE, message=FALSE, warning=FALSE}
+
+#bring back the low n food parts for this analysis, but will be cut later 
+#if they are not meaningful (bark, flower, soil, other)
+indiv_food_part_percentage = clean_food_part %>%
+  group_by(Focal_ID, Sex_Age, Food_part_clean) %>%
+  summarise(total_time = sum(duration_part, na.rm = TRUE), .groups = "drop",
+            bouts = n()) %>%
+  group_by(Focal_ID) %>%
+  mutate(prop_time = total_time / sum(total_time)) %>%
+  ungroup() %>%
+  group_by(Focal_ID, Sex_Age, Food_part_clean) %>%
+  summarise(total_time = sum(total_time),  bouts = sum(bouts), 
+            .groups = "drop") %>%
+  group_by(Focal_ID) %>%
+  mutate(prop_time = total_time / sum(total_time),
+         percent = prop_time * 100) %>%
+  ungroup()
+
+#is my data normal? to use t-test/MANOVA (parametric)?
+prop_model = lm(prop_time ~ Sex_Age, data = indiv_food_part_percentage)
+hist(resid(prop_model)) # not normal
+
+###################### PERMANOVA for composition ##########################
+
+part_diet_matrix = indiv_food_part_percentage %>%
+  group_by(Focal_ID, Sex_Age, Food_part_clean) %>%
+  summarise(prop_time = sum(prop_time), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = Food_part_clean,
+                      values_from = prop_time,
+                      values_fill = 0)
+
+
+part_dist_matrix = vegdist(part_diet_matrix[,-c(1,2)], method = "bray")
+
+adonis2(part_dist_matrix ~ Sex_Age, data = part_diet_matrix)
+#F = 1.73, R2 - 0.20, p = 0.15
+#About 20% of variation in diet composition is explained age/sex, 
+#but not significant
+
+#test assumptions
+betadisper(part_dist_matrix, part_diet_matrix$Sex_Age) %>%
+  anova()
+#F = 0.38, p = 0.56
+#no significant difference in dispersion between groups, PERMANOVA valid
+
+boxplot(part_dist_matrix) #no outliers pulling distance matrix
+
+
+#ploting PERMANOVA in 2D 
+#nto using not important
+part_nmds = metaMDS(part_diet_matrix[,-c(1,2)], distance = "bray", k = 2)
+part_scores = as.data.frame(part_nmds$points)
+part_scores$Sex_Age = part_diet_matrix$Sex_Age
+
+ggplot(part_scores, aes(x = MDS1, y = MDS2, color = Sex_Age)) +
+  geom_point(size = 3) +
+  stat_ellipse(level = 0.95) +
+  theme_minimal()
+
+#do I scrap wilcoxon? 
+# no, keep
+
+#################### Wilcoxon by food type ########################
+
+#fruit wilcox
+wilcox.test(prop_time ~ Sex_Age, data = subset(indiv_food_part_percentage, 
+                                               Food_part_clean == "fruit"))
+#Feeding duration on fruit did not differ significantly between AF and J
+#W = 8, p = 0.90
+
+#leaf wilcox
+wilcox.test(prop_time ~ Sex_Age, data = subset(indiv_food_part_percentage,
+                                               Food_part_clean == "leaf"))
+#Feeding duration on leaves did not differ significantly between AF and J
+#W = 11, p = 0.71
+
+#insect wilcox (CUT!)
+wilcox.test(prop_time ~ Sex_Age, data = subset(indiv_food_part_percentage,
+                                               Food_part_clean == "insect"))
+#W = 2, p = 1
+#low bout n
+
+#shoot wilcox *
+wilcox.test(prop_time ~ Sex_Age, data = subset(indiv_food_part_percentage, 
+                                               Food_part_clean == "shoot"))
+#Feeding duration on shoots differed significantly between AF and J
+#W = 17, p = 0.048 (slightly significant)
+
+#human_foods wilcox
+wilcox.test(prop_time ~ Sex_Age, data = subset(indiv_food_part_percentage,
+                                               Food_part_clean == "human_foods"))
+#Feeding duration on trash did not differ significantly between AF and J
+#W = 0, p = 0.095
+
+#root wilcox
+wilcox.test(prop_time ~ Sex_Age, data = subset(indiv_food_part_percentage, 
+                                               Food_part_clean == "root"))
+#Feeding duration on roots did not differ significantly between AF and J
+#W = 11, p = 0.71
+
+#seed wilcox
+wilcox.test(prop_time ~ Sex_Age, data = subset(indiv_food_part_percentage, 
+                                               Food_part_clean == "seed"))
+#Feeding duration on seeds did not differ significantly between AF and J
+#W = 4, p = 0.26
+
+#mushroom wilcox
+wilcox.test(prop_time ~ Sex_Age, data = subset(indiv_food_part_percentage, 
+                                               Food_part_clean == "mushroom"))
+#W = 2, p = 0.8
+#Feeding duration on mushrooms did not differ significantly between AF and J
+
+#bark wilcox
+wilcox.test(prop_time ~ Sex_Age, data = subset(indiv_food_part_percentage, 
+                                               Food_part_clean == "bark"))
+
+#W = 8, p = 0.381
+#Feeding duration on bark did not differ significantly between AF and J
+
+#flower wilcox
+wilcox.test(prop_time ~ Sex_Age, data = subset(indiv_food_part_percentage, 
+                                               Food_part_clean == "flower"))
+#Feeding duration on flowers did not differ significantly between AF and J
+#W = 0, p = 0.2
+#cut 
+
+#soil wilcox
+wilcox.test(prop_time ~ Sex_Age, data = subset(indiv_food_part_percentage, 
+                                               Food_part_clean == "soil"))
+#Feeding duration on soil did not differ significantly between AF and J
+#W = 4, p = 1 
+#maybe cut?
+
+#other wilcox
+wilcox.test(prop_time ~ Sex_Age, data = subset(indiv_food_part_percentage, 
+                                               Food_part_clean == "other"))
+#Feeding duration on other did not differ significantly between AF and J
+#W = 7, p = 0.86
+#maybe cut due to not really meaningful
+
+###################################################################
+wilcox_results = data.frame(
+  Food_type = c("Fruit", "Leaves", "Seeds", "Mushrooms", "Roots",
+                "Shoots", "Human foods", "Bark", "Flowers", "Soil", "Other"),
+  
+  W = c(8, 11, 4, 2, 11, 17, 0, 8, 0, 4, 7),
+  
+  p_value = c(0.90, 0.71, 0.26, 0.80, 0.71,
+              0.048, 0.095, 0.381, 0.20, 1.00, 0.86)
+)
+
+wilcox_results$Interpretation = ifelse(
+  wilcox_results$p_value < 0.05, "*",
+         " ")
+print(wilcox_results)
+
+
+```
+
+```{r GLMM Distribution selection, echo=TRUE}
+
+################## choosing GLMM distribution type ###########################
+ggplot(clean_food_part, aes(x = duration_part)) +
+  geom_histogram(binwidth = 30,
+                 fill = "grey",
+                 color = "black") +
+  labs(x = "Duration of Feeding Bout (seconds)", y = "Frequency") +
+  scale_x_continuous(breaks = seq(0, 600, by = 60)) +
+  theme_minimal()
+#showing gamma distribution (right skew, non-neg), but high number of 10mins
+#which is not traditional gamma distrib...
+
+mean(clean_food_part$duration_part == 600)
+#about 14.8% of the data are 600s, which is a lot, but these are all the "in-prog"
+#to "in-prog" bouts, which means its capping at this number.
+
+hist(clean_food_part$duration_part[clean_food_part$duration_part < 600])
+#without the 600s, the distribution looks more like a gamma distribution, 
+#with a right skew and a long tail.
+
+#I think Gamma distribution is still appropriate, but there is a limitation for
+#capping at 600s, which is something to note in the discussion.
+
+
+#glmm with gamma + log 
+m_gam = glmmTMB(duration_part ~ Sex_Age + Food_part_clean + Sex_Age:Food_part_clean + 
+    (1 | Focal_ID), 
+  family = Gamma(link = "log"),
+  data = clean_food_part
+)
+summary(m_gam)
+
+#log used for interpretability of coefficients as proportional changes in 
+#feeding duration, which is more meaningful for this type of data. This can be 
+#interpreted as the percentage change in feeding duration associated with each 
+#predictor.
+
+#glmm with simplified interaction
+m_simp = glmmTMB(duration_part ~ Sex_Age + Food_part_clean + (1|Focal_ID),
+                     family = lognormal(),
+                     data = clean_food_part)
+summary(m_simp)
+
+#glmm with lognormal distrib
+m_lognorm = glmmTMB(duration_part ~ Sex_Age * Food_part_clean + (1|Focal_ID),
+                     family = lognormal(),
+                     data = clean_food_part)
+summary(m_lognorm)
+
+#glmm with gaussian
+m_gauss = lmer(duration_part ~ Sex_Age * Food_part_clean + (1|Focal_ID),
+                data = clean_food_part)
+summary(m_gauss)
+
+AIC_comp = AIC(m_gam, m_simp,  m_lognorm, m_gauss)
+print(AIC_comp)
+#The GLMM with a Gamma distribution has the lowest AIC, suggesting it is the
+#best fit for the data compared to the lognormal and Gaussian models. This 
+#supports using a Gamma distribution for modeling feeding bout 
+#durations, which are right-skewed and non-negative.
+```
+
+```{r GLMM Gamma LogLink, echo=TRUE}
+
+#set ref food to fruit bc common
+clean_food_part$Food_part_clean = as.factor(clean_food_part$Food_part_clean)
+clean_food_part$Food_part_clean = relevel(
+  clean_food_part$Food_part_clean,
+  ref = "fruit"
+)
+
+### GLMM for duration ###
+glmm_bout = glmmTMB(duration_part ~ Sex_Age * Food_part_clean  + (1 | Focal_ID), 
+  family = Gamma(link = "log"),
+  data = clean_food_part
+)
+summary(glmm_bout)
+
+###### results table ########
+coefs = summary(glmm_bout)$coefficients$cond
+glmm_results = as.data.frame(coefs)
+glmm_results$term = rownames(glmm_results)
+rownames(glmm_results) = NULL
+glmm_results$exp_estimate = exp(glmm_results$Estimate)
+
+glmm_results = glmm_results %>%
+  mutate(
+    is_interaction = str_detect(term, ":"),
+
+    food = case_when(
+      str_detect(term, "Food_part_clean") ~ 
+        str_remove(term, ".*Food_part_clean"),
+      TRUE ~ NA_character_
+    ),
+    Measured = case_when(
+      term == "(Intercept)" ~ "Adult baseline",
+      term == "Sex_AgeJuvenile" ~ "Juvenile vs Adult (baseline food)",
+      is_interaction ~ paste("Juvenile vs Adult:", food),
+      str_detect(term, "Food_part_clean") ~ paste("Adult:", food),
+      TRUE ~ term
+    )) %>%
+    rename(
+      Effect_size = exp_estimate,
+      Std_error = `Std. Error`, 
+      p_value = 'Pr(>|z|)'
+    ) %>%
+  mutate(
+    p_value = case_when(
+      p_value < 0.001 ~ "<0.001",
+      TRUE ~ sprintf("%.3f", p_value)
+    ),
+    significance = case_when(
+      p_value < 0.001 ~ "***", 
+      p_value < 0.01 ~ "**",
+      p_value < 0.05 ~ "*", 
+      TRUE ~ ""
+    )
+  ) %>%
+select(Measured, Estimate, Std_error, Effect_size, p_value, significance)
+print(glmm_results)
+
+#Interpretations:
+#Adults spend more time feeding on fruit (the reference food) compared to other 
+#food types, indicated by the significant positive coefficients for the food part
+#terms.
+#Juveniles do not differ significantly from adults in feeding duration in general
+#(non-significant coefficient), but they do significantly differ from adults in 
+#their feeding duration on human foods (garbage), as indicated by the significant
+#interaction term. It is important to note
+
+#################################################
+```
+
+```{r GLMM Predictions and Plotting, echo=TRUE}
+
+#ggpredict is using the fitted GLMM predictions to create a new data frame with 
+#predicted values and confidence intervals for each combination of food part 
+#and age/sex class.
+
+pred = ggpredict(glmm_bout, terms = c("Food_part_clean", "Sex_Age"))
+pred$group = factor(pred$group,
+                     levels = c("Adult female", "Juvenile"))
+
+#It also transforms the log scale back to the original so it is more easily
+#interpretable for a plot. 
+
+#Graphs indicating predicted feeding bout duration for each food part by
+#Juveniles and AF. Error bars indicate 95% confidence intervals.
+
+#final predicted bar plot: GLMM pred results with error bars
+sig_data = subset(pred, x == "human_foods")
+
+sig_bracket = data.frame(
+  x = 1,  # human_foods (position index)
+  xstart = 11 - 0.2,
+  xend = 11 + 0.2,
+  y = max(sig_data$conf.high) * 1.1,
+  label = "**"
+)
+
+ggplot(pred, aes(x = x, y = predicted, fill = group)) +
+  geom_col(position = position_dodge(0.7), width = 0.6) +
+  geom_errorbar(
+    aes(ymin = conf.low, ymax = conf.high),
+    position = position_dodge(0.7),
+    width = 0.2
+  ) +
+  scale_fill_manual(values = c(
+  "Adult female" = "darkorchid4",
+  "Juvenile" = "gold" 
+)) +
+  geom_segment(
+    data = sig_bracket, 
+    aes(x = xstart, xend = xend, y = y, yend = y), 
+    inherit.aes = FALSE
+  ) +
+   geom_segment(
+    data = sig_bracket,
+    aes(x = xstart, xend = xstart, y = y, yend = y * 0.98),
+    inherit.aes = FALSE
+  ) +
+  geom_segment(
+    data = sig_bracket,
+    aes(x = xend, xend = xend, y = y, yend = y * 0.98),
+    inherit.aes = FALSE
+  ) +
+    geom_text(
+    data = sig_bracket,
+    aes(x = (xstart +xend) /2, y = y * 1.02, label = label),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  scale_y_continuous() +
+  labs(
+    x = "Food Part",
+    y = "Predicted Bout Duration",
+    fill = "Age-Sex Class") +
+  theme_minimal(base_size = 14) +
+  theme(
+  axis.text.x = element_text(size = 14, angle = 45, hjust = 1),
+  axis.title.y = element_text(size = 14),
+  plot.title = element_text(size = 18), 
+  legend.text = element_text(size = 12)) +
+  theme(
+  plot.margin = margin(t = 10, r = 20, b = 10, l = 20)
+)
+
+#save plot
+ggsave(
+  filename = "boxplot5.jpg",
+  plot = last_plot(),
+  width = 13,
+  height = 7,
+  units = "in",
+  dpi = 300
+)
+
+
+
+```
+
+```{r testing assumptions glmm, echo=TRUE}
+
+#Asummption of Gamma = no 0s
+summary(clean_food_part$duration_part)
+#ASsumption of Gamma = right skewed = yes (tested earlier in workflow)
+
+#Assumption of independence handled with random effects (1 | Focal_ID)
+
+#Assumption that random effects covers variation and isn't extremely skewed
+ranef(glmm_bout) 
+#yep
+
+#Assumption that residuals aren't patterned 
+sim_res = simulateResiduals(glmm_bout)
+
+hist(sim_res) #few outliers
+
+plotQQunif(sim_res, group = clean_food_part$Sex_Age)
+#QQ is not masively skewed, but there is some deviation that is stat sig
+
+plot(sim_res)
+
+testDispersion(sim_res)
+#dispersion = 0.63, p < 0.0001 (not good)
+
+plotResiduals(sim_res, clean_food_part$Sex_Age)
+plotResiduals(sim_res, clean_food_part$Food_part_clean)
+plotResiduals(sim_res, clean_food_part$duration_part)
+#so fruit is showing high variance, which may be driving this dispersion
+#issue?
+#is this enough of a fail to cancel the whole duration situation? or using a GLMM?
+
+
+
+########################fruit issue###################################
+ggplot(subset(clean_food_part, Food_part_clean == "fruit"),
+       aes(x = duration_part)) +
+  geom_histogram()
+#so fruit actually has a lot of bouts that are 600seconds long, back to my orig
+#question if gamma is correct...
+
+fruit_ceiling = clean_food_part %>%
+  filter(Food_part_clean == "fruit") %>%
+  summarise(
+    total_bouts = n(),
+    ceiling_bouts = sum(Duration_sec == 600, na.rm = TRUE),
+    percent_ceiling = ceiling_bouts / total_bouts * 100
+  )
+
+table(clean_food_part$Sex_Age, clean_food_part$duration_part == 600)
+prop.table(table(clean_food_part$Sex_Age, clean_food_part$duration_part == 600), 1)
+#similar proportion of AF and J reaching 600 second ceiling
+
+
+
+ggplot(clean_food_part, aes(x = Food_part_clean, y = duration_part)) +
+  geom_boxplot() +
+  theme_minimal()
+
+clean_food_part$ceiling = clean_food_part$duration_part == 600
+
+table(clean_food_part$Food_part_clean, clean_food_part$ceiling)
+prop.table(table(clean_food_part$Food_part_clean, clean_food_part$ceiling), margin = 1)
+
+ggplot(clean_food_part, aes(x = Food_part_clean, fill = ceiling)) +
+  geom_bar(position = "fill") +
+  ylab("Proportion at 600s ceiling") +
+  theme_minimal()
+
+
+```
+
+
